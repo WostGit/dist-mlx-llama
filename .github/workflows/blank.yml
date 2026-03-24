@@ -1,4 +1,4 @@
-name: "Surgical MLX Smoke Test"
+name: "Surgical MLX Smoke Test (v2)"
 on: workflow_dispatch
 
 jobs:
@@ -18,14 +18,13 @@ jobs:
           tags: tag:ci-runner
           args: --reset
 
-      - name: 🐍 Fast Install
-        # We only install 'mlx'. This takes 5 seconds, not 2 minutes.
-        run: pip install mlx
+      - name: 🐍 Surgical Install
+        # Using -m pip ensures the package is bound to the python3 binary we call later
+        run: python3 -m pip install mlx
 
       - name: 🚀 Tensor Handshake
         run: |
           MY_IP=$(tailscale ip -4)
-          echo "My IP: $MY_IP"
           
           # 1. Discovery
           for i in {1..30}; do
@@ -46,27 +45,33 @@ jobs:
             export RANK=1
           fi
 
-          # 3. Execution
+          # 3. Execution (Explicitly calling the same python3)
           python3 -c "
+          import os, sys
           import mlx.core as mx
           import mlx.distributed as dist
-          import os
 
-          os.environ['MASTER_ADDR'] = os.environ['MASTER_ADDR']
+          os.environ['MASTER_ADDR'] = os.environ.get('MASTER_ADDR', '')
           os.environ['MASTER_PORT'] = '12345'
+          os.environ['RANK'] = os.environ.get('RANK', '')
+          os.environ['WORLD_SIZE'] = '2'
 
           print(f'Attempting init on Rank {os.environ[\"RANK\"]}...')
-          dist.init()
-          rank = dist.rank()
-          
-          if rank == 1:
-              x = mx.array([42.0, 1337.0])
-              dist.send(x, dst=0)
-              print('📤 Rank 1: Sent [42.0, 1337.0]')
-          else:
-              y = mx.zeros((2,))
-              y = dist.recv(y, src=1)
-              print(f'📥 Rank 0 received: {y}')
-              if mx.array_equal(y, mx.array([42.0, 1337.0])):
-                  print('✅ SMOKE TEST PASSED')
+          try:
+              dist.init()
+              rank = dist.rank()
+              
+              if rank == 1:
+                  x = mx.array([42.0, 1337.0])
+                  dist.send(x, dst=0)
+                  print('📤 Rank 1: Sent [42.0, 1337.0]')
+              else:
+                  y = mx.zeros((2,))
+                  y = dist.recv(y, src=1)
+                  print(f'📥 Rank 0 received: {y}')
+                  if mx.array_equal(y, mx.array([42.0, 1337.0])):
+                      print('✅ SMOKE TEST PASSED')
+          except Exception as e:
+              print(f'❌ Failed: {e}')
+              sys.exit(1)
           "
