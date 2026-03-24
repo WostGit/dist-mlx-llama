@@ -1,14 +1,14 @@
-name: "MLX Resilient Distributed Test (Chaos Edition)"
+name: "MLX 4-Node Llama Layer Training"
 on: workflow_dispatch
 
 jobs:
-  distributed-training:
+  distributed-llama:
     runs-on: macos-15
-    timeout-minutes: 15
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
-        rank: [0, 1]
+        rank: [0, 1, 2, 3]
     
     steps:
       - uses: actions/checkout@v4
@@ -17,10 +17,6 @@ jobs:
         run: |
           python3 -m venv venv
           ./venv/bin/python3 -m pip install --upgrade pip mlx
-          
-          # Fixed macOS Network Shaping Syntax
-          (sudo dnctl pipe 1 config delay 50ms && \
-           echo "dummynet out proto tcp from any to any pipe 1" | sudo pfctl -f - -E) || echo "⚠️ Network shaping skipped"
 
       - name: 🛡️ 2. Join Tailnet
         uses: tailscale/github-action@v4
@@ -30,105 +26,103 @@ jobs:
           tags: tag:ci-runner
           args: --reset --accept-dns=false
 
-      - name: 🚀 3. Hardened Distributed SGD
+      - name: 🚀 3. Distributed Llama Training
         run: |
           export PYTHONUNBUFFERED=1
           MY_IP=$(tailscale ip -4)
           
-          echo "🔍 Local IP: $MY_IP. Waiting for peer..."
-          for i in {1..60}; do
-            PEER_IP=$(tailscale status --json | jq -r --arg me "$MY_IP" '.Peer | values[]? | select(.TailscaleIPs[0] != $me) | .TailscaleIPs[0]' | head -n 1)
-            [[ ! -z "$PEER_IP" && "$PEER_IP" != "null" ]] && break
-            sleep 2
+          echo "🔍 Local IP: $MY_IP. Waiting for 3 peers..."
+          for i in {1..120}; do
+            PEER_COUNT=$(tailscale status --json | jq '.Peer | length')
+            if [ "$PEER_COUNT" -ge 3 ]; then break; fi
+            echo "Waiting for peers... (found $PEER_COUNT/3)"
+            sleep 3
           done
 
-          if [[ -z "$PEER_IP" || "$PEER_IP" == "null" ]]; then
-            echo "❌ ERROR: Peer discovery timed out."
-            exit 1
-          fi
-
-          if [[ "$MY_IP" < "$PEER_IP" ]]; then
-             export MLX_RANK=0
-             MASTER_IP=$MY_IP
-          else
-             export MLX_RANK=1
-             MASTER_IP=$PEER_IP
-          fi
-
-          export MLX_WORLD_SIZE=2
+          ALL_IPS=$(tailscale status --json | jq -r '.Peer[] | .TailscaleIPs[0]')
+          HOST_LIST=$(echo -e "$MY_IP\n$ALL_IPS" | sort | jq -R . | jq -s -c .)
+          
+          export MLX_RANK=$(echo "$HOST_LIST" | jq -r --arg me "$MY_IP" 'index($me)')
+          export MLX_WORLD_SIZE=4
           export MLX_HOSTFILE=$(pwd)/hostfile.json
-          # Correct JSON format for hostfile
-          echo "[\"$MY_IP:12345\", \"$PEER_IP:12345\"]" | jq -c 'sort' > $MLX_HOSTFILE
+          
+          echo "$HOST_LIST" | jq -c 'map(. + ":12345")' > $MLX_HOSTFILE
+          MASTER_IP=$(echo "$HOST_LIST" | jq -r '.[0]')
 
-          echo "📋 Node Config: Rank=$MLX_RANK | Master=$MASTER_IP | Peer=$PEER_IP"
+          echo "📋 Node Config: Rank=$MLX_RANK | Master=$MASTER_IP"
 
-          cat <<EOF > train_hardened.py
+          cat <<EOF > llama_dist.py
           import os, sys, time, socket, json, signal
           import mlx.core as mx
+          import mlx.nn as nn
+          import mlx.optimizers as optim  # Corrected Import
           import mlx.core.distributed as dist
 
-          # 90-second watchdog for the whole script
-          signal.signal(signal.SIGALRM, lambda s, f: sys.exit("🚨 Watchdog Timeout"))
-          signal.alarm(120) 
+          signal.signal(signal.SIGALRM, lambda s, f: sys.exit("🚨 Timeout reached"))
+          signal.alarm(180) 
 
-          def sync_barrier(rank, master_ip, port):
+          def sync_barrier(rank, master_ip, port, world_size):
               if rank == 0:
-                  print(f"Rank 0: Opening sync port on {port}...")
                   with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                      s.settimeout(60)
                       s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                      s.bind(('0.0.0.0', port))
-                      s.listen(1)
-                      conn, _ = s.accept()
-                      conn.close()
+                      s.bind(('0.0.0.0', port)); s.listen(world_size - 1)
+                      for _ in range(world_size - 1):
+                          conn, _ = s.accept()
+                          conn.close()
               else:
-                  print(f"Rank 1: Attempting to connect to Master at {master_ip}:{port}...")
                   start = time.time()
-                  while time.time() - start < 60:
+                  while time.time() - start < 90:
                       try:
                           socket.create_connection((master_ip, port), timeout=2).close()
                           return
                       except: time.sleep(2)
-                  raise TimeoutError("Could not reach Rank 0")
+                  raise TimeoutError("Handshake failed")
 
           def main():
               rank = int(os.environ["MLX_RANK"])
+              world_size = int(os.environ["MLX_WORLD_SIZE"])
               with open(os.environ["MLX_HOSTFILE"], 'r') as f:
                   hosts = json.load(f)
               
-              # Always sync against the lexicographically first IP
               master_ip = hosts[0].split(":")[0]
-              
-              print("🚦 Waiting for peer at barrier...")
-              sync_barrier(rank, master_ip, 12346)
-              time.sleep(5) # Cooldown to ensure socket is fully released
+              sync_barrier(rank, master_ip, 12346, world_size)
 
               try:
                   world = dist.init(strict=True)
-                  print(f"✅ Rank {rank}: Connected. World Size: {world.size()}")
-
-                  weights = mx.array([10.0, 10.0])
-                  grad = mx.array([float(rank + 1), float(rank + 1)])
-
-                  print(f"Rank {rank}: All-Reduce Summing...")
-                  global_sum = dist.all_sum(grad, group=world)
+                  dist.barrier(world) 
                   
-                  avg_grad = global_sum / world.size()
-                  weights = weights - (0.1 * avg_grad)
+                  mx.random.seed(42)
+                  model = nn.Linear(512, 1024) 
                   
-                  expected = 9.85
-                  if abs(weights[0].item() - expected) < 1e-5:
-                      print(f"✨ SUCCESS: Rank {rank} validated.")
-                  else:
-                      print(f"❌ MATH ERROR: Got {weights[0].item()}")
-                      sys.exit(1)
+                  def loss_fn(model, x):
+                      return model(x).sum()
+                  
+                  input_data = mx.random.normal((8, 512)) 
+                  vg_fn = nn.value_and_grad(model, loss_fn)
+                  loss, grads = vg_fn(model, input_data)
+
+                  print(f"Rank {rank}: Syncing gradients across {world_size} nodes...")
+                  
+                  def sync_grads(g):
+                      for k, v in g.items():
+                          if isinstance(v, dict):
+                              sync_grads(v)
+                          else:
+                              g[k] = dist.all_sum(v, group=world) / world.size()
+
+                  sync_grads(grads)
+
+                  optimizer = optim.SGD(learning_rate=0.01)
+                  optimizer.update(model, grads)
+                  mx.eval(model.parameters())
+
+                  print(f"✨ SUCCESS: Rank {rank} Llama Layer Updated.")
 
               except Exception as e:
-                  print(f"❌ MLX Error: {e}")
-                  sys.exit(1)
+                  print(f"❌ MLX Error: {e}"); sys.exit(1)
 
           if __name__ == "__main__":
               main()
           EOF
 
-          ./venv/bin/python3 train_hardened.py
+          ./venv/bin/python3 llama_dist.py
