@@ -1,4 +1,4 @@
-name: "MLX Distributed Handshake (Final)"
+name: "MLX Distributed Handshake (Consensus Fix)"
 on: workflow_dispatch
 
 jobs:
@@ -29,11 +29,11 @@ jobs:
         run: |
           MY_IP=$(tailscale ip -4)
           
-          # 1. Peer Discovery
-          for i in {1..30}; do
+          # 1. Peer Discovery (Waiting for the "other" runner to join Tailnet)
+          for i in {1..40}; do
             PEER_IP=$(tailscale status --json | jq -r --arg me "$MY_IP" '.Peer | values[]? | select(.TailscaleIPs[0] != $me) | .TailscaleIPs[0]' | head -n 1)
             [[ ! -z "$PEER_IP" && "$PEER_IP" != "null" ]] && break
-            echo "Searching for peer... ($i/30)"
+            echo "Searching for peer... ($i/40)"
             sleep 5
           done
 
@@ -48,33 +48,38 @@ jobs:
             export RANK=1
           fi
 
-          # 3. Create standalone script with verified MLX 0.31.1 syntax
+          # 3. Create standalone script with Explicit Init
           cat <<EOF > smoke_test.py
           import os, sys
           import mlx.core as mx
           import mlx.core.distributed as dist
 
           def main():
-              os.environ["MASTER_ADDR"] = os.getenv("MASTER_ADDR", "")
-              os.environ["MASTER_PORT"] = "12345"
-              os.environ["RANK"] = os.getenv("RANK", "")
-              os.environ["WORLD_SIZE"] = "2"
+              addr = "$MASTER_ADDR"
+              port = 12345
+              rank = int("$RANK")
+              world_size = 2
 
-              print(f"Rank {os.environ['RANK']} connecting to {os.environ['MASTER_ADDR']}...")
+              print(f"Rank {rank} attempting to join cluster at {addr}:{port}...")
               
               try:
-                  # Initialize and capture the Group object
-                  group = dist.init()
-                  rank = group.rank()
+                  # THE FIX: Explicitly pass parameters to break the singleton
+                  group = dist.init(
+                      get_master_addr=lambda: addr,
+                      get_master_port=lambda: port,
+                      get_rank=lambda: rank,
+                      get_world_size=lambda: world_size
+                  )
                   
-                  if rank == 1:
-                      # SENDER
+                  actual_rank = group.rank()
+                  actual_size = group.size()
+                  print(f"✨ Cluster Joined: Rank {actual_rank} of {actual_size}")
+
+                  if actual_rank == 1:
                       x = mx.array([42.0, 1337.0])
                       dist.send(x, dst=0, group=group)
-                      print("📤 Rank 1: Sent [42.0, 1337.0]")
+                      print("📤 Rank 1: Sent Tensor")
                   else:
-                      # RECEIVER (Functional Syntax: returns a new array)
-                      # recv(shape, dtype, src, group=...)
                       print("📥 Rank 0: Waiting for data...")
                       y = dist.recv(shape=[2], dtype=mx.float32, src=1, group=group)
                       print(f"📥 Rank 0 Received: {y.tolist()}")
@@ -82,7 +87,6 @@ jobs:
                       if mx.array_equal(y, mx.array([42.0, 1337.0])):
                           print("✨ HANDSHAKE COMPLETE: Peer-to-Peer AI Cluster Active.")
                       else:
-                          print("⚠️ Data Integrity Error.")
                           sys.exit(1)
               except Exception as e:
                   print(f"❌ Distributed Runtime Error: {e}")
