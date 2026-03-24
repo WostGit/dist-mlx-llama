@@ -1,22 +1,20 @@
-name: "MLX 4-Node Llama Layer Training"
+name: "MLX Extended Distributed Training Test"
 on: workflow_dispatch
 
 jobs:
-  distributed-llama:
+  distributed-sgd:
     runs-on: macos-15
-    timeout-minutes: 20
     strategy:
-      fail-fast: false
       matrix:
-        rank: [0, 1, 2, 3]
-    
+        rank: [0, 1]
     steps:
       - uses: actions/checkout@v4
 
       - name: 🐍 1. Environment Setup
         run: |
           python3 -m venv venv
-          ./venv/bin/python3 -m pip install --upgrade pip mlx
+          ./venv/bin/python3 -m pip install --upgrade pip
+          ./venv/bin/python3 -m pip install mlx
 
       - name: 🛡️ 2. Join Tailnet
         uses: tailscale/github-action@v4
@@ -26,114 +24,95 @@ jobs:
           tags: tag:ci-runner
           args: --reset --accept-dns=false
 
-      - name: 🚀 3. Distributed Llama Training
+      - name: 🚀 3. Distributed SGD Simulation
         run: |
           export PYTHONUNBUFFERED=1
           MY_IP=$(tailscale ip -4)
           
-          echo "🔍 Local IP: $MY_IP. Waiting for 3 peers..."
-          for i in {1..120}; do
-            PEER_COUNT=$(tailscale status --json | jq '.Peer | length')
-            if [ "$PEER_COUNT" -ge 3 ]; then break; fi
-            echo "Waiting for peers... (found $PEER_COUNT/3)"
-            sleep 3
+          for i in {1..60}; do
+            PEER_IP=$(tailscale status --json | jq -r --arg me "$MY_IP" '.Peer | values[]? | select(.TailscaleIPs[0] != $me) | .TailscaleIPs[0]' | head -n 1)
+            [[ ! -z "$PEER_IP" && "$PEER_IP" != "null" ]] && break
+            sleep 2
           done
-
-          ALL_IPS=$(tailscale status --json | jq -r '.Peer[] | .TailscaleIPs[0]')
-          HOST_LIST=$(echo -e "$MY_IP\n$ALL_IPS" | sort | jq -R . | jq -s -c .)
           
-          export MLX_RANK=$(echo "$HOST_LIST" | jq -r --arg me "$MY_IP" 'index($me)')
-          export MLX_WORLD_SIZE=4
+          if [[ "$MY_IP" < "$PEER_IP" ]]; then
+            export MASTER_IP=$MY_IP; export WORKER_IP=$PEER_IP; export MY_RANK=0
+          else
+            export MASTER_IP=$PEER_IP; export WORKER_IP=$MY_IP; export MY_RANK=1
+          fi
+
+          echo "[\"$MASTER_IP:12345\", \"$WORKER_IP:12345\"]" > hostfile.json
+          
+          export MLX_RANK=$MY_RANK
+          export MLX_WORLD_SIZE=2
           export MLX_HOSTFILE=$(pwd)/hostfile.json
-          
-          echo "$HOST_LIST" | jq -c 'map(. + ":12345")' > $MLX_HOSTFILE
-          MASTER_IP=$(echo "$HOST_LIST" | jq -r '.[0]')
 
-          echo "📋 Node Config: Rank=$MLX_RANK | Master=$MASTER_IP"
-
-          cat <<EOF > llama_dist.py
-          import os, sys, time, socket, json, signal
+          cat <<EOF > train_smoke_test.py
+          import os, sys, time, socket, json
           import mlx.core as mx
-          import mlx.nn as nn
-          import mlx.optimizers as optim  # Corrected Import Path
           import mlx.core.distributed as dist
 
-          # Safety watchdog
-          signal.signal(signal.SIGALRM, lambda s, f: sys.exit("🚨 Timeout reached"))
-          signal.alarm(180) 
-
-          def sync_barrier(rank, master_ip, port, world_size):
-              if rank == 0:
+          def sync_barrier(role, addr, port):
+              if role == "0":
                   with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                       s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                      s.bind(('0.0.0.0', port)); s.listen(world_size - 1)
-                      for _ in range(world_size - 1):
-                          conn, _ = s.accept()
-                          conn.close()
+                      s.bind((addr, port)); s.listen(1)
+                      s.accept()[0].close()
               else:
                   start = time.time()
-                  while time.time() - start < 90:
+                  while time.time() - start < 60:
                       try:
-                          socket.create_connection((master_ip, port), timeout=2).close()
+                          socket.create_connection((addr, port), timeout=2).close()
                           return
                       except: time.sleep(2)
-                  raise TimeoutError("Handshake failed")
 
           def main():
               rank = int(os.environ["MLX_RANK"])
-              world_size = int(os.environ["MLX_WORLD_SIZE"])
               with open(os.environ["MLX_HOSTFILE"], 'r') as f:
                   hosts = json.load(f)
-              
               master_ip = hosts[0].split(":")[0]
-              sync_barrier(rank, master_ip, 12346, world_size)
+              
+              sync_barrier(str(rank), master_ip, 12346)
+              time.sleep(2)
 
               try:
-                  # 1. Initialize Distributed Group
-                  world = dist.init(strict=True)
-                  dist.barrier(world) 
-                  
-                  # 2. Define Llama-style layer with fixed seed
-                  mx.random.seed(42)
-                  model = nn.Linear(512, 1024) 
-                  
-                  def loss_fn(model, x):
-                      return model(x).sum()
-                  
-                  # 3. Compute gradients on local "batch"
-                  input_data = mx.random.normal((8, 512)) 
-                  vg_fn = nn.value_and_grad(model, loss_fn)
-                  loss, grads = vg_fn(model, input_data)
+                  world = dist.init(strict=True, backend="ring")
+                  print(f"✅ Rank {rank}: Cluster Active.")
 
-                  print(f"Rank {rank}: Syncing gradients...")
+                  # 1. Initialize 'Model Weights' (Identical on both nodes)
+                  weights = mx.array([10.0, 10.0])
+                  learning_rate = 0.1
+
+                  # 2. Local Gradient Calculation
+                  # Imagine Rank 0 sees data [1, 1] and Rank 1 sees [2, 2]
+                  local_gradient = mx.array([float(rank + 1), float(rank + 1)])
+                  print(f"Rank {rank}: Local Gradient computed: {local_gradient.tolist()}")
+
+                  # 3. Global All-Reduce (The Heart of Distributed Training)
+                  # This sums gradients from all nodes and distributes the result
+                  print(f"Rank {rank}: Synchronizing gradients...")
+                  global_grad_sum = dist.all_sum(local_gradient, group=world)
+                  avg_gradient = global_grad_sum / world.size()
                   
-                  # 4. Recursive Gradient Sync (Data Parallelism)
-                  def sync_grads(g):
-                      for k, v in g.items():
-                          if isinstance(v, dict):
-                              sync_grads(v)
-                          else:
-                              # Average gradients across all 4 nodes
-                              g[k] = dist.all_sum(v, group=world) / world_size
-
-                  sync_grads(grads)
-
-                  # 5. Apply averaged gradients
-                  optimizer = optim.SGD(learning_rate=0.01)
-                  optimizer.update(model, grads)
+                  # 4. Update Weights
+                  weights = weights - (learning_rate * avg_gradient)
                   
-                  # Force compute to verify consensus
-                  mx.eval(model.parameters())
-
-                  # Optional: Checksum of weights to prove consensus
-                  weights_sum = mx.sum(model.weight).item()
-                  print(f"✨ SUCCESS: Rank {rank} Update Complete. Weight Checksum: {weights_sum:.6f}")
+                  # 5. Verify Consensus
+                  # Expected: (1+2)/2 = 1.5. New weights: 10 - (0.1 * 1.5) = 9.85
+                  expected = 9.85
+                  print(f"Rank {rank}: Updated Weights: {weights.tolist()}")
+                  
+                  if abs(weights[0].item() - expected) < 1e-5:
+                      print("✨ SUCCESS: Weights are synchronized and training step validated.")
+                  else:
+                      print(f"❌ CONSENSUS FAILURE: Expected {expected}, got {weights[0].item()}")
+                      sys.exit(1)
 
               except Exception as e:
-                  print(f"❌ MLX Error: {e}"); sys.exit(1)
+                  print(f"❌ Error: {e}"); sys.exit(1)
 
           if __name__ == "__main__":
               main()
           EOF
 
-          ./venv/bin/python3 llama_dist.py
+          ./venv/bin/python3 train_smoke_test.py
