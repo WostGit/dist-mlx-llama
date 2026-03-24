@@ -1,4 +1,4 @@
-name: "MLX Handshake (Strict Consensus)"
+name: "MLX Handshake (Hostfile Edition)"
 on: workflow_dispatch
 
 jobs:
@@ -24,25 +24,38 @@ jobs:
           tags: tag:ci-runner
           args: --reset --accept-dns=false
 
-      - name: 🚀 3. Sync & Handshake
+      - name: 🚀 3. Sync & Atomic Handshake
         run: |
           export PYTHONUNBUFFERED=1
           MY_IP=$(tailscale ip -4)
           
-          # Discovery
+          # 1. Peer Discovery
           for i in {1..60}; do
             PEER_IP=$(tailscale status --json | jq -r --arg me "$MY_IP" '.Peer | values[]? | select(.TailscaleIPs[0] != $me) | .TailscaleIPs[0]' | head -n 1)
             [[ ! -z "$PEER_IP" && "$PEER_IP" != "null" ]] && break
             sleep 2
           done
           
+          # 2. Assign IP Roles (Master is always the smaller IP)
           if [[ "$MY_IP" < "$PEER_IP" ]]; then
-            export MASTER_ADDR=$MY_IP
-            export RANK=0
+            export M_ADDR=$MY_IP
+            export P_ADDR=$PEER_IP
+            export MY_RANK=0
           else
-            export MASTER_ADDR=$PEER_IP
-            export RANK=1
+            export M_ADDR=$PEER_IP
+            export P_ADDR=$MY_IP
+            export MY_RANK=1
           fi
+
+          # 3. Create the Hostfile (MLX needs both IPs listed)
+          echo "$M_ADDR" > hostfile.txt
+          echo "$P_ADDR" >> hostfile.txt
+
+          # 4. Map to MLX-Specific Env Vars
+          export MLX_RANK=$MY_RANK
+          export MLX_WORLD_SIZE=2
+          export MLX_HOSTFILE=$(pwd)/hostfile.txt
+          export MASTER_ADDR=$M_ADDR
           export MASTER_PORT=12345
 
           cat <<EOF > smoke_test.py
@@ -51,42 +64,33 @@ jobs:
           import mlx.core.distributed as dist
 
           def sync_barrier(role, addr, port):
-              """Rigorous TCP handshake before MLX starts."""
               if role == "0":
-                  print(f"Rank 0: Hosting sync at {addr}:{port}...")
                   with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                       s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                       s.bind((addr, port))
                       s.listen(1)
-                      s.settimeout(60)
-                      conn, _ = s.accept()
-                      conn.sendall(b"READY")
-                      conn.close()
+                      s.accept()[0].close()
               else:
-                  print(f"Rank 1: Connecting to Master at {addr}:{port}...")
                   start = time.time()
                   while time.time() - start < 60:
                       try:
-                          with socket.create_connection((addr, port), timeout=2) as s:
-                              if s.recv(10) == b"READY":
-                                  print("Rank 1: Sync Confirmed.")
-                                  return
+                          socket.create_connection((addr, port), timeout=2).close()
+                          return
                       except:
                           time.sleep(2)
-                  raise RuntimeError("Sync Timeout")
 
           def main():
-              rank = int(os.environ["RANK"])
+              rank = os.environ["MLX_RANK"]
               addr = os.environ["MASTER_ADDR"]
               port = int(os.environ["MASTER_PORT"])
               
-              sync_barrier(str(rank), addr, port)
-              time.sleep(5) # Let OS release ports
+              # Physical Sync
+              sync_barrier(rank, addr, port)
+              time.sleep(2)
 
-              print(f"Rank {rank}: Forcing MLX initialization...")
+              print(f"--- [Rank {rank}] MLX Cluster Init ---")
               try:
-                  # STRICT=True forces MLX to fail if it can't find a peer 
-                  # instead of silently becoming a singleton.
+                  # Explicitly use the ring backend with our hostfile
                   world = dist.init(strict=True, backend="ring")
                   
                   print(f"✅ Cluster Linked! Size: {world.size()}")
@@ -94,13 +98,13 @@ jobs:
                   if world.rank() == 1:
                       x = mx.array([42.0, 1337.0])
                       dist.send(x, dst=0, group=world)
-                      print("📤 Rank 1: Sent.")
+                      print("📤 Rank 1: Sent Tensor.")
                   else:
                       y = dist.recv(shape=[2], dtype=mx.float32, src=1, group=world)
                       print(f"📥 Rank 0 Received: {y.tolist()}")
                       print("✨ HANDSHAKE COMPLETE")
               except Exception as e:
-                  print(f"❌ MLX Initialization Failed: {e}")
+                  print(f"❌ MLX Failed: {e}")
                   sys.exit(1)
 
           if __name__ == "__main__":
