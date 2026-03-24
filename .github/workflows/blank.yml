@@ -1,4 +1,4 @@
-name: "MLX Handshake (Explicit Parameters)"
+name: "MLX Handshake (Final Fixed API)"
 on: workflow_dispatch
 
 jobs:
@@ -29,7 +29,7 @@ jobs:
           export PYTHONUNBUFFERED=1
           MY_IP=$(tailscale ip -4)
           
-          # Discovery Loop
+          # Peer Discovery
           for i in {1..60}; do
             PEER_IP=$(tailscale status --json | jq -r --arg me "$MY_IP" '.Peer | values[]? | select(.TailscaleIPs[0] != $me) | .TailscaleIPs[0]' | head -n 1)
             [[ ! -z "$PEER_IP" && "$PEER_IP" != "null" ]] && break
@@ -68,42 +68,39 @@ jobs:
                           time.sleep(1)
 
           def main():
-              rank = int(os.environ["RANK"])
+              rank_env = os.environ["RANK"]
               addr = os.environ["MASTER_ADDR"]
               port = int(os.environ["MASTER_PORT"])
               
-              # 1. Sync
-              sync_barrier(str(rank), addr, port)
-              time.sleep(2) # Buffer to let the OS socket close
+              # 1. Physical Sync Barrier
+              sync_barrier(rank_env, addr, port)
+              time.sleep(2)
 
-              # 2. MLX Handshake with EXPLICIT world group creation
-              print(f"Rank {rank}: Initializing MLX Group...")
+              print(f"--- [Rank {rank_env}] Initializing MLX Group ---")
               try:
-                  # We use the init() to set the environment, then explicitly check group size
-                  dist.init()
+                  # THE KEY: Capture the returned Group object
+                  world = dist.init()
                   
-                  # If global init fails to find peers, we force the group creation
-                  # In MLX, we can access the default group via dist.is_available() checks
-                  if dist.size() < 2:
-                      # Final attempt: Re-init with explicit env force
-                      os.environ["MLX_DISTRIBUTED_REDEZVOUS"] = f"tcp://{addr}:{port}"
-                      dist.init()
+                  # Call methods on the group object, not the module
+                  actual_rank = world.rank()
+                  actual_size = world.size()
+                  
+                  if actual_size < 2:
+                      raise RuntimeError(f"Singleton Error: Handshake failed (Size: {actual_size})")
 
-                  if dist.size() < 2:
-                      raise RuntimeError(f"Still Singleton. Size: {dist.size()}")
+                  print(f"✅ Cluster Formed! Rank {actual_rank} of {actual_size}")
 
-                  print(f"✅ Cluster Linked! Rank {dist.rank()} of {dist.size()}")
-
-                  if dist.rank() == 1:
+                  if actual_rank == 1:
                       x = mx.array([42.0, 1337.0])
-                      dist.send(x, dst=0)
+                      dist.send(x, dst=0, group=world)
                       print("📤 Rank 1: Sent Tensor.")
                   else:
-                      y = dist.recv(shape=[2], dtype=mx.float32, src=1)
+                      print("📥 Rank 0: Waiting for data...")
+                      y = dist.recv(shape=[2], dtype=mx.float32, src=1, group=world)
                       print(f"📥 Rank 0 Received: {y.tolist()}")
                       print("✨ HANDSHAKE COMPLETE")
               except Exception as e:
-                  print(f"❌ MLX Error: {e}")
+                  print(f"❌ Error: {e}")
                   sys.exit(1)
 
           if __name__ == "__main__":
