@@ -1,8 +1,8 @@
-name: "MLX Handshake (Raw List Edition)"
+name: "MLX Extended Distributed Training Test"
 on: workflow_dispatch
 
 jobs:
-  smoke-test:
+  distributed-sgd:
     runs-on: macos-15
     strategy:
       matrix:
@@ -24,12 +24,11 @@ jobs:
           tags: tag:ci-runner
           args: --reset --accept-dns=false
 
-      - name: 🚀 3. Sync & Atomic Handshake
+      - name: 🚀 3. Distributed SGD Simulation
         run: |
           export PYTHONUNBUFFERED=1
           MY_IP=$(tailscale ip -4)
           
-          # 1. Peer Discovery
           for i in {1..60}; do
             PEER_IP=$(tailscale status --json | jq -r --arg me "$MY_IP" '.Peer | values[]? | select(.TailscaleIPs[0] != $me) | .TailscaleIPs[0]' | head -n 1)
             [[ ! -z "$PEER_IP" && "$PEER_IP" != "null" ]] && break
@@ -37,28 +36,18 @@ jobs:
           done
           
           if [[ "$MY_IP" < "$PEER_IP" ]]; then
-            export MASTER_IP=$MY_IP
-            export WORKER_IP=$PEER_IP
-            export MY_RANK=0
+            export MASTER_IP=$MY_IP; export WORKER_IP=$PEER_IP; export MY_RANK=0
           else
-            export MASTER_IP=$PEER_IP
-            export WORKER_IP=$MY_IP
-            export MY_RANK=1
+            export MASTER_IP=$PEER_IP; export WORKER_IP=$MY_IP; export MY_RANK=1
           fi
 
-          # 3. Create JSON List Hostfile (Standard Ring Format)
-          # Format: ["IP:PORT", "IP:PORT"]
-          PORT=12345
-          echo "[\"$MASTER_IP:$PORT\", \"$WORKER_IP:$PORT\"]" > hostfile.json
-          echo "--- Hostfile ---"
-          cat hostfile.json
-
-          # 4. MLX Env Vars
+          echo "[\"$MASTER_IP:12345\", \"$WORKER_IP:12345\"]" > hostfile.json
+          
           export MLX_RANK=$MY_RANK
           export MLX_WORLD_SIZE=2
           export MLX_HOSTFILE=$(pwd)/hostfile.json
 
-          cat <<EOF > smoke_test.py
+          cat <<EOF > train_smoke_test.py
           import os, sys, time, socket, json
           import mlx.core as mx
           import mlx.core.distributed as dist
@@ -67,8 +56,7 @@ jobs:
               if role == "0":
                   with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                       s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                      s.bind((addr, port))
-                      s.listen(1)
+                      s.bind((addr, port)); s.listen(1)
                       s.accept()[0].close()
               else:
                   start = time.time()
@@ -76,41 +64,55 @@ jobs:
                       try:
                           socket.create_connection((addr, port), timeout=2).close()
                           return
-                      except:
-                          time.sleep(2)
+                      except: time.sleep(2)
 
           def main():
-              rank = os.environ["MLX_RANK"]
+              rank = int(os.environ["MLX_RANK"])
               with open(os.environ["MLX_HOSTFILE"], 'r') as f:
                   hosts = json.load(f)
-              
-              # Use port 12346 for sync to keep 12345 for MLX
               master_ip = hosts[0].split(":")[0]
-              sync_barrier(rank, master_ip, 12346)
+              
+              sync_barrier(str(rank), master_ip, 12346)
               time.sleep(2)
 
-              print(f"--- [Rank {rank}] MLX Cluster Init ---")
               try:
-                  # Force RING backend with strict checking
                   world = dist.init(strict=True, backend="ring")
-                  
-                  print(f"✅ Cluster Linked! Size: {world.size()}")
+                  print(f"✅ Rank {rank}: Cluster Active.")
 
-                  if world.rank() == 1:
-                      x = mx.array([42.0, 1337.0])
-                      dist.send(x, dst=0, group=world)
-                      print("📤 Rank 1: Sent Tensor.")
+                  # 1. Initialize 'Model Weights' (Identical on both nodes)
+                  weights = mx.array([10.0, 10.0])
+                  learning_rate = 0.1
+
+                  # 2. Local Gradient Calculation
+                  # Imagine Rank 0 sees data [1, 1] and Rank 1 sees [2, 2]
+                  local_gradient = mx.array([float(rank + 1), float(rank + 1)])
+                  print(f"Rank {rank}: Local Gradient computed: {local_gradient.tolist()}")
+
+                  # 3. Global All-Reduce (The Heart of Distributed Training)
+                  # This sums gradients from all nodes and distributes the result
+                  print(f"Rank {rank}: Synchronizing gradients...")
+                  global_grad_sum = dist.all_sum(local_gradient, group=world)
+                  avg_gradient = global_grad_sum / world.size()
+                  
+                  # 4. Update Weights
+                  weights = weights - (learning_rate * avg_gradient)
+                  
+                  # 5. Verify Consensus
+                  # Expected: (1+2)/2 = 1.5. New weights: 10 - (0.1 * 1.5) = 9.85
+                  expected = 9.85
+                  print(f"Rank {rank}: Updated Weights: {weights.tolist()}")
+                  
+                  if abs(weights[0].item() - expected) < 1e-5:
+                      print("✨ SUCCESS: Weights are synchronized and training step validated.")
                   else:
-                      print("📥 Rank 0: Waiting for data...")
-                      y = dist.recv(shape=[2], dtype=mx.float32, src=1, group=world)
-                      print(f"📥 Rank 0 Received: {y.tolist()}")
-                      print("✨ HANDSHAKE COMPLETE")
+                      print(f"❌ CONSENSUS FAILURE: Expected {expected}, got {weights[0].item()}")
+                      sys.exit(1)
+
               except Exception as e:
-                  print(f"❌ MLX Failed: {e}")
-                  sys.exit(1)
+                  print(f"❌ Error: {e}"); sys.exit(1)
 
           if __name__ == "__main__":
               main()
           EOF
 
-          ./venv/bin/python3 smoke_test.py
+          ./venv/bin/python3 train_smoke_test.py
