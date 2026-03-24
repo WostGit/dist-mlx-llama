@@ -1,4 +1,4 @@
-name: "Surgical MLX Smoke Test (v2)"
+name: "MLX Distributed Handshake"
 on: workflow_dispatch
 
 jobs:
@@ -19,24 +19,24 @@ jobs:
           args: --reset
 
       - name: 🐍 Surgical Install
-        # Using -m pip ensures the package is bound to the python3 binary we call later
-        run: python3 -m pip install mlx
+        # Force installation to the specific python3 environment
+        run: python3 -m pip install --upgrade pip mlx
 
       - name: 🚀 Tensor Handshake
         run: |
           MY_IP=$(tailscale ip -4)
           
-          # 1. Discovery
-          for i in {1..30}; do
+          # 1. Peer Discovery
+          for i in {1..20}; do
             PEER_IP=$(tailscale status --json | jq -r --arg me "$MY_IP" '.Peer | values[]? | select(.TailscaleIPs[0] != $me) | .TailscaleIPs[0]' | head -n 1)
             [[ ! -z "$PEER_IP" && "$PEER_IP" != "null" ]] && break
-            echo "Searching for peer... ($i/30)"
+            echo "Searching for peer... ($i/20)"
             sleep 5
           done
 
-          if [[ -z "$PEER_IP" ]]; then echo "No peer found"; exit 1; fi
+          if [[ -z "$PEER_IP" ]]; then echo "Peer timeout"; exit 1; fi
 
-          # 2. Roles
+          # 2. Role Assignment
           if [[ "$MY_IP" < "$PEER_IP" ]]; then
             export MASTER_ADDR=$MY_IP
             export RANK=0
@@ -45,33 +45,46 @@ jobs:
             export RANK=1
           fi
 
-          # 3. Execution (Explicitly calling the same python3)
-          python3 -c "
+          # 3. Execution (Using Heredoc for clean environment passing)
+          python3 <<EOF
           import os, sys
-          import mlx.core as mx
-          import mlx.distributed as dist
+          import subprocess
 
-          os.environ['MASTER_ADDR'] = os.environ.get('MASTER_ADDR', '')
-          os.environ['MASTER_PORT'] = '12345'
-          os.environ['RANK'] = os.environ.get('RANK', '')
-          os.environ['WORLD_SIZE'] = '2'
+          # Debug: Print where we are looking for modules
+          print(f"Python Executable: {sys.executable}")
+          
+          try:
+              import mlx.core as mx
+              import mlx.distributed as dist
+              print("✅ MLX Import Successful")
+          except ImportError as e:
+              print(f"❌ MLX still not found: {e}")
+              print("Search paths:", sys.path)
+              sys.exit(1)
 
-          print(f'Attempting init on Rank {os.environ[\"RANK\"]}...')
+          # Set distributed environment variables
+          os.environ["MASTER_ADDR"] = "$MASTER_ADDR"
+          os.environ["MASTER_PORT"] = "12345"
+          os.environ["RANK"] = "$RANK"
+          os.environ["WORLD_SIZE"] = "2"
+
+          print(f"Initializing Dist on Rank {os.environ['RANK']} (Master: {os.environ['MASTER_ADDR']})...")
+          
           try:
               dist.init()
               rank = dist.rank()
-              
+
               if rank == 1:
                   x = mx.array([42.0, 1337.0])
                   dist.send(x, dst=0)
-                  print('📤 Rank 1: Sent [42.0, 1337.0]')
+                  print("📤 Rank 1: Sent Tensor [42.0, 1337.0]")
               else:
                   y = mx.zeros((2,))
                   y = dist.recv(y, src=1)
-                  print(f'📥 Rank 0 received: {y}')
+                  print(f"📥 Rank 0 Received: {y}")
                   if mx.array_equal(y, mx.array([42.0, 1337.0])):
-                      print('✅ SMOKE TEST PASSED')
+                      print("✨ HANDSHAKE COMPLETE: Peer-to-Peer AI Cluster Active")
           except Exception as e:
-              print(f'❌ Failed: {e}')
+              print(f"❌ Distributed Operation Failed: {e}")
               sys.exit(1)
-          "
+          EOF
