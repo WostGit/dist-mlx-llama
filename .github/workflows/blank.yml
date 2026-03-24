@@ -1,4 +1,4 @@
-name: "MLX Handshake (JSON Topology)"
+name: "MLX Handshake (URI Edition)"
 on: workflow_dispatch
 
 jobs:
@@ -36,7 +36,7 @@ jobs:
             sleep 2
           done
           
-          # 2. Determine Master and Worker
+          # 2. Assign Master/Worker Roles
           if [[ "$MY_IP" < "$PEER_IP" ]]; then
             export MASTER_IP=$MY_IP
             export WORKER_IP=$PEER_IP
@@ -47,65 +47,74 @@ jobs:
             export MY_RANK=1
           fi
 
-          # 3. Create JSON Hostfile (Crucial for MLX Ring Backend)
-          # Format: {"0": "IP_0", "1": "IP_1"}
-          echo "{\"0\": \"$MASTER_IP\", \"1\": \"$WORKER_IP\"}" > hostfile.json
+          # 3. Create JSON Hostfile with TCP URIs
+          # Format: {"0": "tcp://IP:PORT", "1": "tcp://IP:PORT"}
+          PORT=12345
+          echo "{\"0\": \"tcp://$MASTER_IP:$PORT\", \"1\": \"tcp://$WORKER_IP:$PORT\"}" > hostfile.json
+          echo "--- Generated Hostfile ---"
           cat hostfile.json
 
-          # 4. Export exact MLX Env Vars
+          # 4. Export MLX Env Vars
           export MLX_RANK=$MY_RANK
           export MLX_WORLD_SIZE=2
           export MLX_HOSTFILE=$(pwd)/hostfile.json
 
           cat <<EOF > smoke_test.py
-          import os, sys, time, socket
+          import os, sys, time, socket, json
           import mlx.core as mx
           import mlx.core.distributed as dist
 
           def sync_barrier(role, addr, port):
-              # Simple TCP sync to ensure both nodes are at the same point
+              """Python-level TCP sync to ensure paths are open."""
               if role == "0":
                   with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                       s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                       s.bind((addr, port))
                       s.listen(1)
-                      s.accept()[0].close()
+                      conn, _ = s.accept()
+                      conn.close()
               else:
                   start = time.time()
                   while time.time() - start < 60:
                       try:
-                          socket.create_connection((addr, port), timeout=2).close()
-                          return
+                          with socket.create_connection((addr, port), timeout=2):
+                              return
                       except:
                           time.sleep(2)
 
           def main():
               rank = os.environ["MLX_RANK"]
-              # We use the Master IP for the sync barrier
-              import json
               with open(os.environ["MLX_HOSTFILE"], 'r') as f:
                   host_map = json.load(f)
               
-              master_ip = host_map["0"]
-              sync_barrier(rank, master_ip, 12345)
+              # Extract clean IP from the "tcp://IP:PORT" string for the sync barrier
+              master_uri = host_map["0"]
+              master_ip = master_uri.replace("tcp://", "").split(":")[0]
+              
+              # Use a secondary port (12346) for the barrier so 12345 is clean for MLX
+              sync_barrier(rank, master_ip, 12346)
               time.sleep(2)
 
               print(f"--- [Rank {rank}] MLX Cluster Init ---")
               try:
-                  # MLX will automatically look for MLX_RANK and MLX_HOSTFILE
+                  # MLX init consumes MLX_RANK and MLX_HOSTFILE automatically
                   world = dist.init(strict=True)
                   
                   print(f"✅ Cluster Linked! Size: {world.size()}")
 
                   if world.rank() == 1:
+                      # Data to send
                       x = mx.array([42.0, 1337.0])
                       dist.send(x, dst=0, group=world)
-                      print("📤 Rank 1: Sent Tensor.")
+                      print("📤 Rank 1: Sent Tensor [42.0, 1337.0]")
                   else:
                       print("📥 Rank 0: Waiting for data...")
                       y = dist.recv(shape=[2], dtype=mx.float32, src=1, group=world)
                       print(f"📥 Rank 0 Received: {y.tolist()}")
-                      print("✨ HANDSHAKE COMPLETE")
+                      
+                      # Validation
+                      if mx.array_equal(y, mx.array([42.0, 1337.0])):
+                          print("✨ HANDSHAKE COMPLETE: Peer-to-Peer AI Cluster Active.")
               except Exception as e:
                   print(f"❌ MLX Failed: {e}")
                   sys.exit(1)
