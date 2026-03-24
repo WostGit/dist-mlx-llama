@@ -1,4 +1,4 @@
-name: "MLX Handshake (Final Fixed API)"
+name: "MLX Handshake (Strict Consensus)"
 on: workflow_dispatch
 
 jobs:
@@ -29,7 +29,7 @@ jobs:
           export PYTHONUNBUFFERED=1
           MY_IP=$(tailscale ip -4)
           
-          # Peer Discovery
+          # Discovery
           for i in {1..60}; do
             PEER_IP=$(tailscale status --json | jq -r --arg me "$MY_IP" '.Peer | values[]? | select(.TailscaleIPs[0] != $me) | .TailscaleIPs[0]' | head -n 1)
             [[ ! -z "$PEER_IP" && "$PEER_IP" != "null" ]] && break
@@ -51,56 +51,56 @@ jobs:
           import mlx.core.distributed as dist
 
           def sync_barrier(role, addr, port):
+              """Rigorous TCP handshake before MLX starts."""
               if role == "0":
+                  print(f"Rank 0: Hosting sync at {addr}:{port}...")
                   with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                       s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                       s.bind((addr, port))
                       s.listen(1)
+                      s.settimeout(60)
                       conn, _ = s.accept()
+                      conn.sendall(b"READY")
                       conn.close()
               else:
-                  start_time = time.time()
-                  while time.time() - start_time < 60:
+                  print(f"Rank 1: Connecting to Master at {addr}:{port}...")
+                  start = time.time()
+                  while time.time() - start < 60:
                       try:
-                          with socket.create_connection((addr, port), timeout=2):
-                              return
+                          with socket.create_connection((addr, port), timeout=2) as s:
+                              if s.recv(10) == b"READY":
+                                  print("Rank 1: Sync Confirmed.")
+                                  return
                       except:
-                          time.sleep(1)
+                          time.sleep(2)
+                  raise RuntimeError("Sync Timeout")
 
           def main():
-              rank_env = os.environ["RANK"]
+              rank = int(os.environ["RANK"])
               addr = os.environ["MASTER_ADDR"]
               port = int(os.environ["MASTER_PORT"])
               
-              # 1. Physical Sync Barrier
-              sync_barrier(rank_env, addr, port)
-              time.sleep(2)
+              sync_barrier(str(rank), addr, port)
+              time.sleep(5) # Let OS release ports
 
-              print(f"--- [Rank {rank_env}] Initializing MLX Group ---")
+              print(f"Rank {rank}: Forcing MLX initialization...")
               try:
-                  # THE KEY: Capture the returned Group object
-                  world = dist.init()
+                  # STRICT=True forces MLX to fail if it can't find a peer 
+                  # instead of silently becoming a singleton.
+                  world = dist.init(strict=True, backend="ring")
                   
-                  # Call methods on the group object, not the module
-                  actual_rank = world.rank()
-                  actual_size = world.size()
-                  
-                  if actual_size < 2:
-                      raise RuntimeError(f"Singleton Error: Handshake failed (Size: {actual_size})")
+                  print(f"✅ Cluster Linked! Size: {world.size()}")
 
-                  print(f"✅ Cluster Formed! Rank {actual_rank} of {actual_size}")
-
-                  if actual_rank == 1:
+                  if world.rank() == 1:
                       x = mx.array([42.0, 1337.0])
                       dist.send(x, dst=0, group=world)
-                      print("📤 Rank 1: Sent Tensor.")
+                      print("📤 Rank 1: Sent.")
                   else:
-                      print("📥 Rank 0: Waiting for data...")
                       y = dist.recv(shape=[2], dtype=mx.float32, src=1, group=world)
                       print(f"📥 Rank 0 Received: {y.tolist()}")
                       print("✨ HANDSHAKE COMPLETE")
               except Exception as e:
-                  print(f"❌ Error: {e}")
+                  print(f"❌ MLX Initialization Failed: {e}")
                   sys.exit(1)
 
           if __name__ == "__main__":
