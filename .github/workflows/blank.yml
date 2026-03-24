@@ -1,4 +1,4 @@
-name: "MLX Handshake (Hostfile Edition)"
+name: "MLX Handshake (JSON Topology)"
 on: workflow_dispatch
 
 jobs:
@@ -36,27 +36,26 @@ jobs:
             sleep 2
           done
           
-          # 2. Assign IP Roles (Master is always the smaller IP)
+          # 2. Determine Master and Worker
           if [[ "$MY_IP" < "$PEER_IP" ]]; then
-            export M_ADDR=$MY_IP
-            export P_ADDR=$PEER_IP
+            export MASTER_IP=$MY_IP
+            export WORKER_IP=$PEER_IP
             export MY_RANK=0
           else
-            export M_ADDR=$PEER_IP
-            export P_ADDR=$MY_IP
+            export MASTER_IP=$PEER_IP
+            export WORKER_IP=$MY_IP
             export MY_RANK=1
           fi
 
-          # 3. Create the Hostfile (MLX needs both IPs listed)
-          echo "$M_ADDR" > hostfile.txt
-          echo "$P_ADDR" >> hostfile.txt
+          # 3. Create JSON Hostfile (Crucial for MLX Ring Backend)
+          # Format: {"0": "IP_0", "1": "IP_1"}
+          echo "{\"0\": \"$MASTER_IP\", \"1\": \"$WORKER_IP\"}" > hostfile.json
+          cat hostfile.json
 
-          # 4. Map to MLX-Specific Env Vars
+          # 4. Export exact MLX Env Vars
           export MLX_RANK=$MY_RANK
           export MLX_WORLD_SIZE=2
-          export MLX_HOSTFILE=$(pwd)/hostfile.txt
-          export MASTER_ADDR=$M_ADDR
-          export MASTER_PORT=12345
+          export MLX_HOSTFILE=$(pwd)/hostfile.json
 
           cat <<EOF > smoke_test.py
           import os, sys, time, socket
@@ -64,6 +63,7 @@ jobs:
           import mlx.core.distributed as dist
 
           def sync_barrier(role, addr, port):
+              # Simple TCP sync to ensure both nodes are at the same point
               if role == "0":
                   with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                       s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -81,17 +81,19 @@ jobs:
 
           def main():
               rank = os.environ["MLX_RANK"]
-              addr = os.environ["MASTER_ADDR"]
-              port = int(os.environ["MASTER_PORT"])
+              # We use the Master IP for the sync barrier
+              import json
+              with open(os.environ["MLX_HOSTFILE"], 'r') as f:
+                  host_map = json.load(f)
               
-              # Physical Sync
-              sync_barrier(rank, addr, port)
+              master_ip = host_map["0"]
+              sync_barrier(rank, master_ip, 12345)
               time.sleep(2)
 
               print(f"--- [Rank {rank}] MLX Cluster Init ---")
               try:
-                  # Explicitly use the ring backend with our hostfile
-                  world = dist.init(strict=True, backend="ring")
+                  # MLX will automatically look for MLX_RANK and MLX_HOSTFILE
+                  world = dist.init(strict=True)
                   
                   print(f"✅ Cluster Linked! Size: {world.size()}")
 
@@ -100,6 +102,7 @@ jobs:
                       dist.send(x, dst=0, group=world)
                       print("📤 Rank 1: Sent Tensor.")
                   else:
+                      print("📥 Rank 0: Waiting for data...")
                       y = dist.recv(shape=[2], dtype=mx.float32, src=1, group=world)
                       print(f"📥 Rank 0 Received: {y.tolist()}")
                       print("✨ HANDSHAKE COMPLETE")
