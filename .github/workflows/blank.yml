@@ -1,4 +1,4 @@
-name: "MLX Distributed Handshake (Final Consensus)"
+name: "MLX Handshake (Final Consensus)"
 on: workflow_dispatch
 
 jobs:
@@ -10,7 +10,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: 🐍 1. Pre-Install MLX
+      - name: 🐍 1. Environment Setup
         run: |
           python3 -m venv venv
           ./venv/bin/python3 -m pip install --upgrade pip
@@ -29,15 +29,14 @@ jobs:
           export PYTHONUNBUFFERED=1
           MY_IP=$(tailscale ip -4)
           
-          # 1. Peer Discovery
+          # Discovery
           for i in {1..60}; do
             PEER_IP=$(tailscale status --json | jq -r --arg me "$MY_IP" '.Peer | values[]? | select(.TailscaleIPs[0] != $me) | .TailscaleIPs[0]' | head -n 1)
             [[ ! -z "$PEER_IP" && "$PEER_IP" != "null" ]] && break
             sleep 2
           done
-          if [[ -z "$PEER_IP" ]]; then echo "Peer timeout"; exit 1; fi
-
-          # 2. Assign Roles
+          
+          # Roles
           if [[ "$MY_IP" < "$PEER_IP" ]]; then
             export MASTER_ADDR=$MY_IP
             export RANK=0
@@ -48,44 +47,49 @@ jobs:
           export MASTER_PORT=12345
           export WORLD_SIZE=2
 
-          # 3. Write and Execute
+          # SYNC BARRIER: Rank 1 waits for Rank 0's Port to be LIVE
+          if [[ "$RANK" == "1" ]]; then
+            echo "Worker: Probing Master at $MASTER_ADDR:$MASTER_PORT..."
+            until nc -z -v -w5 "$MASTER_ADDR" "$MASTER_PORT"; do
+              echo "Waiting for Master port..."
+              sleep 2
+            done
+            echo "Master is LIVE. Starting Python..."
+          fi
+
           cat <<EOF > smoke_test.py
           import os, sys, time
           import mlx.core as mx
           import mlx.core.distributed as dist
 
           def main():
-              rank = int(os.environ["RANK"])
-              master = os.environ["MASTER_ADDR"]
-              port = int(os.environ["MASTER_PORT"])
+              # Explicitly set these for the C++ backend
+              os.environ["MASTER_ADDR"] = "$MASTER_ADDR"
+              os.environ["MASTER_PORT"] = "$MASTER_PORT"
+              os.environ["RANK"] = "$RANK"
+              os.environ["WORLD_SIZE"] = "2"
               
-              print(f"--- Node Identity ---")
-              print(f"Rank: {rank} | Master: {master}:{port}")
-              print(f"---------------------")
-
+              print(f"--- [Rank {os.environ['RANK']}] Starting Handshake ---")
+              
               try:
-                  # Force a staggered start: Master starts first
-                  if rank == 1:
-                      print("Worker: Waiting 10s for Master to initialize...")
-                      time.sleep(10)
-                  
-                  # Initialize
-                  group = dist.init()
+                  # Use 'ring' backend for reliable TCP over Tailscale
+                  group = dist.init(backend="ring")
                   
                   if group.size() < 2:
-                      raise RuntimeError(f"Singleton detected (Size: {group.size()}). Handshake failed.")
+                      raise RuntimeError(f"Singleton Error: Size is {group.size()}")
 
-                  if rank == 1:
+                  print(f"✅ Cluster Formed! Size: {group.size()}")
+
+                  if group.rank() == 1:
                       x = mx.array([42.0, 1337.0])
                       dist.send(x, dst=0, group=group)
-                      print("📤 Rank 1: Successfully sent Tensor.")
+                      print("📤 Rank 1: Data Sent.")
                   else:
-                      print("📥 Rank 0: Listening for data...")
                       y = dist.recv(shape=[2], dtype=mx.float32, src=1, group=group)
                       print(f"📥 Rank 0 Received: {y.tolist()}")
                       print("✨ HANDSHAKE COMPLETE")
               except Exception as e:
-                  print(f"❌ Distributed Error: {e}")
+                  print(f"❌ Error: {e}")
                   sys.exit(1)
 
           if __name__ == "__main__":
