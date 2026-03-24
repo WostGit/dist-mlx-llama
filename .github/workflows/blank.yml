@@ -55,16 +55,15 @@ jobs:
           import os, sys, time, socket, json, signal
           import mlx.core as mx
           import mlx.nn as nn
-          import mlx.nn.optimizers as optim
+          import mlx.optimizers as optim  # Corrected Import Path
           import mlx.core.distributed as dist
 
-          # 3-minute safety watchdog
+          # Safety watchdog
           signal.signal(signal.SIGALRM, lambda s, f: sys.exit("🚨 Timeout reached"))
           signal.alarm(180) 
 
           def sync_barrier(rank, master_ip, port, world_size):
               if rank == 0:
-                  print(f"Rank 0: Orchestrating handshake for {world_size} nodes...")
                   with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                       s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                       s.bind(('0.0.0.0', port)); s.listen(world_size - 1)
@@ -72,7 +71,6 @@ jobs:
                           conn, _ = s.accept()
                           conn.close()
               else:
-                  print(f"Rank {rank}: Connecting to Master at {master_ip}...")
                   start = time.time()
                   while time.time() - start < 90:
                       try:
@@ -91,43 +89,45 @@ jobs:
               sync_barrier(rank, master_ip, 12346, world_size)
 
               try:
-                  # Initialize Distributed Group
+                  # 1. Initialize Distributed Group
                   world = dist.init(strict=True)
                   dist.barrier(world) 
                   
-                  # Standard Llama Layer parameters (Linear Projection)
+                  # 2. Define Llama-style layer with fixed seed
                   mx.random.seed(42)
                   model = nn.Linear(512, 1024) 
                   
-                  # Training Step
                   def loss_fn(model, x):
                       return model(x).sum()
                   
+                  # 3. Compute gradients on local "batch"
                   input_data = mx.random.normal((8, 512)) 
                   vg_fn = nn.value_and_grad(model, loss_fn)
                   loss, grads = vg_fn(model, input_data)
 
-                  print(f"Rank {rank}: Starting All-Reduce for Llama layer...")
+                  print(f"Rank {rank}: Syncing gradients...")
                   
-                  # Recursive Gradient Sync (Data Parallelism)
+                  # 4. Recursive Gradient Sync (Data Parallelism)
                   def sync_grads(g):
                       for k, v in g.items():
                           if isinstance(v, dict):
                               sync_grads(v)
                           else:
                               # Average gradients across all 4 nodes
-                              g[k] = dist.all_sum(v, group=world) / world.size()
+                              g[k] = dist.all_sum(v, group=world) / world_size
 
                   sync_grads(grads)
 
-                  # Apply averaged gradients
+                  # 5. Apply averaged gradients
                   optimizer = optim.SGD(learning_rate=0.01)
                   optimizer.update(model, grads)
                   
-                  # Force compute to verify no hangs
+                  # Force compute to verify consensus
                   mx.eval(model.parameters())
 
-                  print(f"✨ SUCCESS: Rank {rank} synchronized and updated Llama layer weights.")
+                  # Optional: Checksum of weights to prove consensus
+                  weights_sum = mx.sum(model.weight).item()
+                  print(f"✨ SUCCESS: Rank {rank} Update Complete. Weight Checksum: {weights_sum:.6f}")
 
               except Exception as e:
                   print(f"❌ MLX Error: {e}"); sys.exit(1)
