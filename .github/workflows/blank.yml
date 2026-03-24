@@ -3,7 +3,7 @@ on: workflow_dispatch
 
 jobs:
   smoke-test:
-    runs-runs-on: macos-15
+    runs-on: macos-15
     strategy:
       matrix:
         rank: [0, 1]
