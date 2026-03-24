@@ -1,0 +1,104 @@
+name: "Llama-3.1-8B Distributed Training"
+on: workflow_dispatch
+
+jobs:
+  dist-train:
+    runs-on: macos-15
+    strategy:
+      matrix:
+        rank: [0, 1] # Launches two parallel Mac runners
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 🛡️ Join Tailnet
+        uses: tailscale/github-action@v4
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci-runner
+          args: --reset
+
+      - name: 🐍 Install MLX & Dependencies
+        run: |
+          pip install --upgrade pip
+          pip install "mlx-lm[train]>=0.21.0"
+          pip install huggingface_hub
+
+      - name: 📝 Generate Mock Training Data
+        run: |
+          cat <<EOF > data.jsonl
+          {"text": "MLX is a powerful framework for Apple Silicon."}
+          {"text": "Tailscale allows for secure P2P networking for AI."}
+          {"text": "Distributed training on ephemeral runners is a breakthrough."}
+          EOF
+
+      - name: 🚀 Peer Discovery & Training
+        run: |
+          # 1. Identify Peers
+          MY_IP=$(tailscale ip -4)
+          echo "My IP: $MY_IP"
+          
+          for i in {1..30}; do
+            PEER_IP=$(tailscale status --json | jq -r --arg me "$MY_IP" '.Peer | values[]? | select(.TailscaleIPs[0] != $me) | .TailscaleIPs[0]' | head -n 1)
+            if [ ! -z "$PEER_IP" ] && [ "$PEER_IP" != "null" ]; then break; fi
+            echo "Waiting for peer ($i/30)..."
+            sleep 5
+          done
+
+          # 2. Assign Master/Worker Roles
+          # The node with the 'lower' IP address becomes the Master (Rank 0)
+          if [[ "$MY_IP" < "$PEER_IP" ]]; then
+            export MASTER_ADDR=$MY_IP
+            export WORLD_RANK=0
+          else
+            export MASTER_ADDR=$PEER_IP
+            export WORLD_RANK=1
+          fi
+
+          echo "--- NETWORK TOPOLOGY ---"
+          echo "RANK: $WORLD_RANK"
+          echo "MASTER_ADDR: $MASTER_ADDR"
+          echo "------------------------"
+
+          # 3. Create the Training Entrypoint
+          cat <<'EOF' > train_dist.py
+          import mlx.core as mx
+          import mlx.distributed as dist
+          from mlx_lm import lora
+          import os, sys
+
+          def main():
+              # Initialize Distributed Backend via Tailscale
+              os.environ["MASTER_ADDR"] = os.environ.get("MASTER_ADDR")
+              os.environ["MASTER_PORT"] = "12345"
+              
+              try:
+                  dist.init()
+                  print(f"✅ Rank {dist.rank()} of {dist.size()} online on {mx.default_device()}")
+              except Exception as e:
+                  print(f"❌ Dist init failed: {e}")
+                  sys.exit(1)
+
+              # Hyperparameters optimized for your 176 Mbps baseline
+              # We use high accumulation steps to minimize sync frequency
+              args = lora.TrainingArgs(
+                  batch_size=1,
+                  iters=100,
+                  steps_per_report=5,
+                  grad_accumulation_steps=16, 
+                  learning_rate=1e-5,
+                  adapter_file="adapters.safetensors"
+              )
+
+              # Placeholder for training call
+              # In a real run, you would point to mlx-community/Meta-Llama-3.1-8B-4bit
+              print("🚀 Starting training loop. Syncing gradients over Tailscale...")
+              # lora.train(model_path="mlx-community/Meta-Llama-3.1-8B-4bit", training_args=args, data="data.jsonl")
+
+          if __name__ == "__main__":
+              main()
+          EOF
+
+          # 4. Fire!
+          export MASTER_ADDR=$MASTER_ADDR
+          python3 train_dist.py
