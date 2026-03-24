@@ -1,4 +1,4 @@
-name: "MLX 4-Node Distributed Llama Test"
+name: "MLX 4-Node Llama Layer Training"
 on: workflow_dispatch
 
 jobs:
@@ -8,7 +8,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        rank: [0, 1, 2, 3] # Scaled to 4 nodes
+        rank: [0, 1, 2, 3]
     
     steps:
       - uses: actions/checkout@v4
@@ -26,45 +26,45 @@ jobs:
           tags: tag:ci-runner
           args: --reset --accept-dns=false
 
-      - name: 🚀 3. Distributed Llama Layer Training
+      - name: 🚀 3. Distributed Llama Training
         run: |
           export PYTHONUNBUFFERED=1
           MY_IP=$(tailscale ip -4)
           
           echo "🔍 Local IP: $MY_IP. Waiting for 3 peers..."
-          # Discovery loop modified to wait for 4 total nodes
-          for i in {1..100}; do
+          for i in {1..120}; do
             PEER_COUNT=$(tailscale status --json | jq '.Peer | length')
             if [ "$PEER_COUNT" -ge 3 ]; then break; fi
+            echo "Waiting for peers... (found $PEER_COUNT/3)"
             sleep 3
           done
 
-          # Get all IPs in the tailnet with this tag
           ALL_IPS=$(tailscale status --json | jq -r '.Peer[] | .TailscaleIPs[0]')
-          # Include myself and sort to ensure all nodes have the exact same list
           HOST_LIST=$(echo -e "$MY_IP\n$ALL_IPS" | sort | jq -R . | jq -s -c .)
           
           export MLX_RANK=$(echo "$HOST_LIST" | jq -r --arg me "$MY_IP" 'index($me)')
           export MLX_WORLD_SIZE=4
           export MLX_HOSTFILE=$(pwd)/hostfile.json
           
-          # Format hostfile as ["IP1:12345", "IP2:12345", ...]
           echo "$HOST_LIST" | jq -c 'map(. + ":12345")' > $MLX_HOSTFILE
           MASTER_IP=$(echo "$HOST_LIST" | jq -r '.[0]')
 
-          echo "📋 Node Config: Rank=$MLX_RANK | Master=$MASTER_IP | Total=4"
+          echo "📋 Node Config: Rank=$MLX_RANK | Master=$MASTER_IP"
 
           cat <<EOF > llama_dist.py
           import os, sys, time, socket, json, signal
           import mlx.core as mx
           import mlx.nn as nn
+          import mlx.nn.optimizers as optim
           import mlx.core.distributed as dist
 
-          signal.signal(signal.SIGALRM, lambda s, f: sys.exit("🚨 Timeout"))
+          # 3-minute safety watchdog
+          signal.signal(signal.SIGALRM, lambda s, f: sys.exit("🚨 Timeout reached"))
           signal.alarm(180) 
 
           def sync_barrier(rank, master_ip, port, world_size):
               if rank == 0:
+                  print(f"Rank 0: Orchestrating handshake for {world_size} nodes...")
                   with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                       s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                       s.bind(('0.0.0.0', port)); s.listen(world_size - 1)
@@ -72,12 +72,14 @@ jobs:
                           conn, _ = s.accept()
                           conn.close()
               else:
-                  connected = False
-                  while not connected:
+                  print(f"Rank {rank}: Connecting to Master at {master_ip}...")
+                  start = time.time()
+                  while time.time() - start < 90:
                       try:
                           socket.create_connection((master_ip, port), timeout=2).close()
-                          connected = True
+                          return
                       except: time.sleep(2)
+                  raise TimeoutError("Handshake failed")
 
           def main():
               rank = int(os.environ["MLX_RANK"])
@@ -89,50 +91,43 @@ jobs:
               sync_barrier(rank, master_ip, 12346, world_size)
 
               try:
+                  # Initialize Distributed Group
                   world = dist.init(strict=True)
+                  dist.barrier(world) 
                   
-                  # 1. Define a Llama-style Linear Layer (e.g., Hidden Dim 4096)
+                  # Standard Llama Layer parameters (Linear Projection)
+                  mx.random.seed(42)
                   model = nn.Linear(512, 1024) 
                   
-                  # 2. Ensure all nodes start with the SAME weights
-                  # In real training, Rank 0 would broadcast weights to others
-                  mx.random.seed(42) 
-                  
-                  # 3. Dummy Forward Pass
-                  # Each node sees a different "batch" of data
-                  input_data = mx.random.normal((8, 512)) 
-                  output = model(input_data)
-                  loss = output.sum()
-
-                  # 4. Backward Pass (Local Gradients)
-                  # In MLX, we use value_and_grad to get gradients
+                  # Training Step
                   def loss_fn(model, x):
                       return model(x).sum()
                   
+                  input_data = mx.random.normal((8, 512)) 
                   vg_fn = nn.value_and_grad(model, loss_fn)
                   loss, grads = vg_fn(model, input_data)
 
-                  # 5. Distributed All-Reduce (The Heart of Distributed Llama)
-                  # We average the gradients across all 4 nodes
-                  print(f"Rank {rank}: Synchronizing Llama layer gradients...")
+                  print(f"Rank {rank}: Starting All-Reduce for Llama layer...")
                   
-                  def sync_grads(grads):
-                      for k, v in grads.items():
+                  # Recursive Gradient Sync (Data Parallelism)
+                  def sync_grads(g):
+                      for k, v in g.items():
                           if isinstance(v, dict):
                               sync_grads(v)
                           else:
-                              # Sum across all 4 nodes and average
-                              summed = dist.all_sum(v, group=world)
-                              grads[k] = summed / world.size()
+                              # Average gradients across all 4 nodes
+                              g[k] = dist.all_sum(v, group=world) / world.size()
 
                   sync_grads(grads)
 
-                  # 6. Apply Gradients (SGD Step)
-                  optimizer = nn.optim.SGD(learning_rate=0.01)
+                  # Apply averaged gradients
+                  optimizer = optim.SGD(learning_rate=0.01)
                   optimizer.update(model, grads)
+                  
+                  # Force compute to verify no hangs
                   mx.eval(model.parameters())
 
-                  print(f"✨ SUCCESS: Rank {rank} finished Llama layer update.")
+                  print(f"✨ SUCCESS: Rank {rank} synchronized and updated Llama layer weights.")
 
               except Exception as e:
                   print(f"❌ MLX Error: {e}"); sys.exit(1)
