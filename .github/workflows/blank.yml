@@ -1,4 +1,4 @@
-name: "MLX Distributed Handshake (Atomic)"
+name: "MLX Distributed Handshake (Final Consensus)"
 on: workflow_dispatch
 
 jobs:
@@ -10,13 +10,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: 🐍 1. Pre-Install MLX (Internet Active)
+      - name: 🐍 1. Pre-Install MLX
         run: |
           python3 -m venv venv
           ./venv/bin/python3 -m pip install --upgrade pip
           ./venv/bin/python3 -m pip install mlx
 
-      - name: 🛡️ 2. Join Tailnet (DNS Protected)
+      - name: 🛡️ 2. Join Tailnet
         uses: tailscale/github-action@v4
         with:
           oauth-client-id: ${{ secrets.TS_OAUTH_ID }}
@@ -24,26 +24,20 @@ jobs:
           tags: tag:ci-runner
           args: --reset --accept-dns=false
 
-      - name: 🚀 3. Sync & Atomic Handshake
+      - name: 🚀 3. Atomic Handshake
         run: |
+          export PYTHONUNBUFFERED=1
           MY_IP=$(tailscale ip -4)
-          echo "My IP: $MY_IP"
           
-          # Discovery Loop
+          # 1. Peer Discovery
           for i in {1..60}; do
             PEER_IP=$(tailscale status --json | jq -r --arg me "$MY_IP" '.Peer | values[]? | select(.TailscaleIPs[0] != $me) | .TailscaleIPs[0]' | head -n 1)
-            if [[ ! -z "$PEER_IP" && "$PEER_IP" != "null" ]]; then
-              echo "Found Peer: $PEER_IP"
-              if ping -c 1 -W 1 "$PEER_IP" > /dev/null; then
-                break
-              fi
-            fi
+            [[ ! -z "$PEER_IP" && "$PEER_IP" != "null" ]] && break
             sleep 2
           done
-
           if [[ -z "$PEER_IP" ]]; then echo "Peer timeout"; exit 1; fi
 
-          # Role Assignment
+          # 2. Assign Roles
           if [[ "$MY_IP" < "$PEER_IP" ]]; then
             export MASTER_ADDR=$MY_IP
             export RANK=0
@@ -54,31 +48,44 @@ jobs:
           export MASTER_PORT=12345
           export WORLD_SIZE=2
 
-          # Write AND Run in the same step to guarantee file presence
+          # 3. Write and Execute
           cat <<EOF > smoke_test.py
           import os, sys, time
           import mlx.core as mx
           import mlx.core.distributed as dist
 
           def main():
-              print(f"Node starting... Rank: {os.environ.get('RANK')} | Master: {os.environ.get('MASTER_ADDR')}")
+              rank = int(os.environ["RANK"])
+              master = os.environ["MASTER_ADDR"]
+              port = int(os.environ["MASTER_PORT"])
+              
+              print(f"--- Node Identity ---")
+              print(f"Rank: {rank} | Master: {master}:{port}")
+              print(f"---------------------")
+
               try:
-                  # Small buffer for concurrent startup
-                  time.sleep(5)
-                  group = dist.init()
-                  rank = group.rank()
+                  # Force a staggered start: Master starts first
+                  if rank == 1:
+                      print("Worker: Waiting 10s for Master to initialize...")
+                      time.sleep(10)
                   
+                  # Initialize
+                  group = dist.init()
+                  
+                  if group.size() < 2:
+                      raise RuntimeError(f"Singleton detected (Size: {group.size()}). Handshake failed.")
+
                   if rank == 1:
                       x = mx.array([42.0, 1337.0])
                       dist.send(x, dst=0, group=group)
-                      print("📤 Rank 1: Sent Tensor")
+                      print("📤 Rank 1: Successfully sent Tensor.")
                   else:
-                      print("📥 Rank 0: Waiting for data...")
+                      print("📥 Rank 0: Listening for data...")
                       y = dist.recv(shape=[2], dtype=mx.float32, src=1, group=group)
                       print(f"📥 Rank 0 Received: {y.tolist()}")
                       print("✨ HANDSHAKE COMPLETE")
               except Exception as e:
-                  print(f"❌ Error: {e}")
+                  print(f"❌ Distributed Error: {e}")
                   sys.exit(1)
 
           if __name__ == "__main__":
