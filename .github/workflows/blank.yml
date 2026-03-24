@@ -1,4 +1,4 @@
-name: "MLX Handshake (Python Sync)"
+name: "MLX Handshake (Explicit Parameters)"
 on: workflow_dispatch
 
 jobs:
@@ -45,61 +45,61 @@ jobs:
           fi
           export MASTER_PORT=12345
 
-          # Atomic Write and Run
           cat <<EOF > smoke_test.py
           import os, sys, time, socket
           import mlx.core as mx
           import mlx.core.distributed as dist
 
           def sync_barrier(role, addr, port):
-              """Ensures both nodes are online before MLX takes over."""
               if role == "0":
-                  print(f"Rank 0: Opening sync socket on {addr}:{port}...")
                   with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                       s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                       s.bind((addr, port))
                       s.listen(1)
                       conn, _ = s.accept()
                       conn.close()
-                  print("Rank 0: Sync confirmed. Peer connected.")
               else:
-                  print(f"Rank 1: Probing Master at {addr}:{port}...")
                   start_time = time.time()
-                  while time.time() - start_time < 120:
+                  while time.time() - start_time < 60:
                       try:
                           with socket.create_connection((addr, port), timeout=2):
-                              print("Rank 1: Sync confirmed. Connected to Master.")
                               return
-                      except (ConnectionRefusedError, socket.timeout):
-                          time.sleep(2)
-                  raise RuntimeError("Sync Barrier Timeout")
+                      except:
+                          time.sleep(1)
 
           def main():
-              rank = os.environ["RANK"]
+              rank = int(os.environ["RANK"])
               addr = os.environ["MASTER_ADDR"]
               port = int(os.environ["MASTER_PORT"])
               
-              # 1. Physical Sync
-              sync_barrier(rank, addr, port)
-              
-              # 2. Wait 2 seconds to allow OS to clear the socket
-              time.sleep(2)
+              # 1. Sync
+              sync_barrier(str(rank), addr, port)
+              time.sleep(2) # Buffer to let the OS socket close
 
-              # 3. MLX Handshake
-              print(f"Rank {rank}: Initializing MLX Distributed...")
+              # 2. MLX Handshake with EXPLICIT world group creation
+              print(f"Rank {rank}: Initializing MLX Group...")
               try:
-                  # Force 'ring' (TCP) backend
-                  group = dist.init(backend="ring")
+                  # We use the init() to set the environment, then explicitly check group size
+                  dist.init()
                   
-                  if group.size() < 2:
-                      raise RuntimeError("Singleton Error: Still size 1 after sync.")
+                  # If global init fails to find peers, we force the group creation
+                  # In MLX, we can access the default group via dist.is_available() checks
+                  if dist.size() < 2:
+                      # Final attempt: Re-init with explicit env force
+                      os.environ["MLX_DISTRIBUTED_REDEZVOUS"] = f"tcp://{addr}:{port}"
+                      dist.init()
 
-                  if group.rank() == 1:
+                  if dist.size() < 2:
+                      raise RuntimeError(f"Still Singleton. Size: {dist.size()}")
+
+                  print(f"✅ Cluster Linked! Rank {dist.rank()} of {dist.size()}")
+
+                  if dist.rank() == 1:
                       x = mx.array([42.0, 1337.0])
-                      dist.send(x, dst=0, group=group)
+                      dist.send(x, dst=0)
                       print("📤 Rank 1: Sent Tensor.")
                   else:
-                      y = dist.recv(shape=[2], dtype=mx.float32, src=1, group=group)
+                      y = dist.recv(shape=[2], dtype=mx.float32, src=1)
                       print(f"📥 Rank 0 Received: {y.tolist()}")
                       print("✨ HANDSHAKE COMPLETE")
               except Exception as e:
