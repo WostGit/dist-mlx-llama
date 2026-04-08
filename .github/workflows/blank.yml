@@ -1,20 +1,24 @@
-name: "MLX Extended Distributed Training Test"
+name: "MLX Resilient Distributed Test (Chaos Edition)"
 on: workflow_dispatch
 
 jobs:
-  distributed-sgd:
+  distributed-training:
     runs-on: macos-15
+    timeout-minutes: 15
     strategy:
+      fail-fast: false
       matrix:
         rank: [0, 1]
+    
     steps:
       - uses: actions/checkout@v4
 
-      - name: 🐍 1. Environment Setup
+      - name: 🐍 1. Environment & Network Shaping
         run: |
           python3 -m venv venv
-          ./venv/bin/python3 -m pip install --upgrade pip
-          ./venv/bin/python3 -m pip install mlx
+          ./venv/bin/python3 -m pip install --upgrade pip mlx
+          # Apply network shaping if possible (non-blocking)
+          (sudo dnctl pipe 1 config delay 50ms && sudo dnctl add 1 pipe 1 ip from any to any) || echo "Network shaping skipped"
 
       - name: 🛡️ 2. Join Tailnet
         uses: tailscale/github-action@v4
@@ -24,95 +28,111 @@ jobs:
           tags: tag:ci-runner
           args: --reset --accept-dns=false
 
-      - name: 🚀 3. Distributed SGD Simulation
+      - name: 🚀 3. Hardened Distributed SGD
         run: |
           export PYTHONUNBUFFERED=1
           MY_IP=$(tailscale ip -4)
           
-          for i in {1..60}; do
+          echo "🔍 Discovering peers..."
+          for i in {1..30}; do
             PEER_IP=$(tailscale status --json | jq -r --arg me "$MY_IP" '.Peer | values[]? | select(.TailscaleIPs[0] != $me) | .TailscaleIPs[0]' | head -n 1)
             [[ ! -z "$PEER_IP" && "$PEER_IP" != "null" ]] && break
-            sleep 2
+            sleep 5
           done
-          
-          if [[ "$MY_IP" < "$PEER_IP" ]]; then
-            export MASTER_IP=$MY_IP; export WORKER_IP=$PEER_IP; export MY_RANK=0
-          else
-            export MASTER_IP=$PEER_IP; export WORKER_IP=$MY_IP; export MY_RANK=1
+
+          if [[ -z "$PEER_IP" || "$PEER_IP" == "null" ]]; then
+            echo "❌ ERROR: Peer discovery timed out."
+            exit 1
           fi
 
-          echo "[\"$MASTER_IP:12345\", \"$WORKER_IP:12345\"]" > hostfile.json
-          
-          export MLX_RANK=$MY_RANK
+          # Decide Master/Worker
+          if [[ "$MY_IP" < "$PEER_IP" ]]; then
+             export MLX_RANK=0
+             MASTER=$MY_IP
+             WORKER=$PEER_IP
+          else
+             export MLX_RANK=1
+             MASTER=$PEER_IP
+             WORKER=$MY_IP
+          fi
+
+          # CRITICAL FIX: Export these for MLX to see them!
           export MLX_WORLD_SIZE=2
           export MLX_HOSTFILE=$(pwd)/hostfile.json
+          echo "[\"$MASTER:12345\", \"$WORKER:12345\"]" > $MLX_HOSTFILE
 
-          cat <<EOF > train_smoke_test.py
-          import os, sys, time, socket, json
+          echo "📋 Config: Rank=$MLX_RANK, Master=$MASTER, Worker=$WORKER"
+
+          cat <<EOF > train_hardened.py
+          import os, sys, time, socket, json, signal
           import mlx.core as mx
           import mlx.core.distributed as dist
 
+          def watchdog(signum, frame):
+              print("\n🚨 CRITICAL FAILURE: Process deadlocked. Terminating.")
+              sys.exit(2)
+          
+          signal.signal(signal.SIGALRM, watchdog)
+          signal.alarm(90) 
+
           def sync_barrier(role, addr, port):
-              if role == "0":
-                  with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                      s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                      s.bind((addr, port)); s.listen(1)
-                      s.accept()[0].close()
-              else:
-                  start = time.time()
-                  while time.time() - start < 60:
-                      try:
-                          socket.create_connection((addr, port), timeout=2).close()
-                          return
-                      except: time.sleep(2)
+              try:
+                  if role == 0:
+                      with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                          s.settimeout(60)
+                          s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                          s.bind((addr, port)); s.listen(1)
+                          print(f"Master waiting on {addr}:{port}...")
+                          s.accept()[0].close()
+                  else:
+                      start = time.time()
+                      while time.time() - start < 60:
+                          try:
+                              socket.create_connection((addr, port), timeout=2).close()
+                              print("Connected to Master.")
+                              return
+                          except: time.sleep(2)
+                      raise TimeoutError("Handshake failed")
+              except Exception as e:
+                  print(f"❌ Barrier Error: {e}"); sys.exit(1)
 
           def main():
-              rank = int(os.environ["MLX_RANK"])
-              with open(os.environ["MLX_HOSTFILE"], 'r') as f:
-                  hosts = json.load(f)
-              master_ip = hosts[0].split(":")[0]
+              # Read from exported environment variables
+              rank = int(os.environ.get("MLX_RANK", -1))
+              hostfile = os.environ.get("MLX_HOSTFILE")
               
-              sync_barrier(str(rank), master_ip, 12346)
-              time.sleep(2)
+              with open(hostfile, 'r') as f:
+                  hosts = json.load(f)
+              
+              master_ip = hosts[0].split(":")[0]
+              sync_barrier(rank, master_ip, 12346)
 
               try:
-                  world = dist.init(strict=True, backend="ring")
+                  world = dist.init(strict=True)
                   print(f"✅ Rank {rank}: Cluster Active.")
 
-                  # 1. Initialize 'Model Weights' (Identical on both nodes)
                   weights = mx.array([10.0, 10.0])
-                  learning_rate = 0.1
+                  grad = mx.array([float(rank + 1), float(rank + 1)])
 
-                  # 2. Local Gradient Calculation
-                  # Imagine Rank 0 sees data [1, 1] and Rank 1 sees [2, 2]
-                  local_gradient = mx.array([float(rank + 1), float(rank + 1)])
-                  print(f"Rank {rank}: Local Gradient computed: {local_gradient.tolist()}")
-
-                  # 3. Global All-Reduce (The Heart of Distributed Training)
-                  # This sums gradients from all nodes and distributes the result
-                  print(f"Rank {rank}: Synchronizing gradients...")
-                  global_grad_sum = dist.all_sum(local_gradient, group=world)
-                  avg_gradient = global_grad_sum / world.size()
+                  print(f"Rank {rank}: Synchronizing...")
+                  global_sum = dist.all_sum(grad, group=world)
                   
-                  # 4. Update Weights
-                  weights = weights - (learning_rate * avg_gradient)
+                  avg_grad = global_sum / world.size()
+                  weights = weights - (0.1 * avg_grad)
                   
-                  # 5. Verify Consensus
-                  # Expected: (1+2)/2 = 1.5. New weights: 10 - (0.1 * 1.5) = 9.85
-                  expected = 9.85
-                  print(f"Rank {rank}: Updated Weights: {weights.tolist()}")
-                  
-                  if abs(weights[0].item() - expected) < 1e-5:
-                      print("✨ SUCCESS: Weights are synchronized and training step validated.")
+                  if mx.allclose(weights, mx.array([9.85, 9.85])):
+                      print(f"✨ SUCCESS: Node {rank} validated training step.")
+                      signal.alarm(0)
                   else:
-                      print(f"❌ CONSENSUS FAILURE: Expected {expected}, got {weights[0].item()}")
+                      print(f"❌ CONSENSUS FAILURE: Got {weights.tolist()}")
                       sys.exit(1)
 
               except Exception as e:
-                  print(f"❌ Error: {e}"); sys.exit(1)
+                  print(f"❌ MLX Runtime Error: {e}")
+                  sys.exit(1)
 
           if __name__ == "__main__":
               main()
           EOF
 
-          ./venv/bin/python3 train_smoke_test.py
+          ./venv/bin/python3 train_hardened.py
